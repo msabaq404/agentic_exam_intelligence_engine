@@ -1,0 +1,134 @@
+name: exam_enriched
+version: "0.1.0"
+description: "Coral source exposing the persistent, structured exam intelligence schema produced by enrichment agents. Tables contain enriched questions, textbook chunks, chapter links, topic statistics, pattern clusters, and student performance."
+inputs:
+  EXAM_DB_PATH:
+    kind: variable
+    hint: "Path to the persistent structured DB (example: ./data/exam_intel.db)."
+    required: true
+backend:
+  kind: sqlite
+  location: "{{input.EXAM_DB_PATH}}"
+
+tables:
+  - table_name: exam_questions
+    description: "Structured, enriched question records produced by the enrichment agent."
+    columns:
+      - name: question_id
+        data_type: Utf8
+      - name: source_id
+        data_type: Utf8
+      - name: year
+        data_type: Int64
+      - name: topic
+        data_type: Utf8
+      - name: subtopic
+        data_type: Utf8
+      - name: difficulty
+        data_type: Utf8
+      - name: question_type
+        data_type: Utf8
+      - name: concepts_json
+        data_type: Utf8
+      - name: prerequisites_json
+        data_type: Utf8
+      - name: semantic_tags_json
+        data_type: Utf8
+      - name: pattern_type
+        data_type: Utf8
+      - name: conceptual_depth
+        data_type: Float64
+      - name: importance_score
+        data_type: Float64
+      - name: confidence
+        data_type: Float64
+
+  - table_name: exam_textbook_chunks
+    description: "Textbook chunks and their semantic annotations."
+    columns:
+      - name: chunk_id
+        data_type: Utf8
+      - name: source_id
+        data_type: Utf8
+      - name: chapter
+        data_type: Utf8
+      - name: section
+        data_type: Utf8
+      - name: main_concept
+        data_type: Utf8
+      - name: prerequisites_json
+        data_type: Utf8
+      - name: formulas_json
+        data_type: Utf8
+      - name: definitions_json
+        data_type: Utf8
+      - name: semantic_tags_json
+        data_type: Utf8
+      - name: exam_relevance_score
+        data_type: Float64
+      - name: conceptual_importance
+        data_type: Float64
+
+  - table_name: exam_chapter_links
+    description: "Links between enriched questions and textbook chunks with rationale."
+    columns:
+      - name: question_id
+        data_type: Utf8
+      - name: chunk_id
+        data_type: Utf8
+      - name: link_score
+        data_type: Float64
+      - name: link_reason
+        data_type: Utf8
+
+  - table_name: exam_topic_statistics
+    description: "Aggregated topical statistics used for analytics and ranking."
+    columns:
+      - name: topic
+        data_type: Utf8
+      - name: frequency
+        data_type: Int64
+      - name: avg_marks
+        data_type: Float64
+      - name: recurrence_score
+        data_type: Float64
+      - name: trend_score
+        data_type: Float64
+      - name: importance_index
+        data_type: Float64
+      - name: chapter_roi_score
+        data_type: Float64
+
+  - table_name: exam_pattern_clusters
+    description: "Detected recurring pattern clusters across questions."
+    columns:
+      - name: cluster_id
+        data_type: Utf8
+      - name: pattern_name
+        data_type: Utf8
+      - name: related_topics_json
+        data_type: Utf8
+      - name: frequency
+        data_type: Int64
+      - name: conceptual_type
+        data_type: Utf8
+
+  - table_name: exam_student_performance
+    description: "Per-user performance and weakness metrics by topic."
+    columns:
+      - name: user_id
+        data_type: Utf8
+      - name: topic
+        data_type: Utf8
+      - name: score
+        data_type: Float64
+      - name: accuracy
+        data_type: Float64
+      - name: weakness_score
+        data_type: Float64
+      - name: last_practiced
+        data_type: Timestamp
+
+test_queries:
+  - "SELECT topic, frequency FROM exam_topic_statistics ORDER BY frequency DESC LIMIT 20"
+  - "SELECT question_id, topic, importance_score FROM exam_questions ORDER BY importance_score DESC LIMIT 20"
