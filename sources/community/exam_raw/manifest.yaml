@@ -1,29 +1,61 @@
 name: exam_raw
 version: "0.1.0"
-description: "Coral source exposing raw PDF documents, pages, and text chunks for the exam ingestion pipeline. Use this source to surface uploaded PDFs into Coral tables for downstream enrichment agents."
+description: "Coral source exposing raw PDF documents, pages, and text chunks from the persistent ingestion database. Use this source to query uploaded educational documents, page text, and chunked source content through SQL before enrichment."
 inputs:
-  EXAM_PDF_DIR:
+  PGHOST:
     kind: variable
-    hint: "Local path containing uploaded PDFs (example: ./data/pdfs)."
+    hint: "PostgreSQL host for the ingestion database (example: localhost)."
+    required: true
+  PGPORT:
+    kind: variable
+    hint: "PostgreSQL port for the ingestion database (example: 5432)."
+    required: true
+  PGDATABASE:
+    kind: variable
+    hint: "PostgreSQL database name containing the ingestion tables (example: postgres)."
+    required: true
+  PGUSER:
+    kind: variable
+    hint: "PostgreSQL user with read access to ingestion tables (example: postgres)."
+    required: true
+  PGPASSWORD:
+    kind: secret
+    hint: "PostgreSQL password for the ingestion database user."
     required: true
 backend:
-  kind: file
-  location: "{{input.EXAM_PDF_DIR}}"
+  kind: postgres
+  host: "{{input.PGHOST}}"
+  port: "{{input.PGPORT}}"
+  database: "{{input.PGDATABASE}}"
+  user: "{{input.PGUSER}}"
+  password: "{{input.PGPASSWORD}}"
 tables:
   - table_name: pdf_documents
-    description: "One row per uploaded PDF document with basic metadata."
+    description: "One row per uploaded PDF document with explicit source kind and coverage metadata."
     columns:
       - name: source_id
         data_type: Utf8
-      - name: source_type
+      - name: source_kind
+        data_type: Utf8
+      - name: source_subtype
         data_type: Utf8
       - name: subject
         data_type: Utf8
-      - name: year
+      - name: publication_year
+        data_type: Int64
+      - name: coverage_start_year
+        data_type: Int64
+      - name: coverage_end_year
+        data_type: Int64
+      - name: coverage_years_json
         data_type: Utf8
       - name: upload_timestamp
         data_type: Timestamp
       - name: checksum
+        data_type: Utf8
+      - name: owner_user_id
+        data_type: Utf8
+      - name: source_uri
         data_type: Utf8
       - name: filename
         data_type: Utf8
@@ -43,7 +75,7 @@ tables:
         data_type: Float64
 
   - table_name: pdf_chunks
-    description: "Semantic chunks extracted from pages (e.g., question blocks, paragraphs). Used as input to enrichment agents."
+    description: "Question candidates or normalized source blocks extracted from pages. These are staging rows used to reconstruct exact PYQ structure before enrichment writes to the final exam tables."
     columns:
       - name: chunk_id
         data_type: Utf8
@@ -61,6 +93,6 @@ tables:
         data_type: Utf8
 
 test_queries:
-  - "SELECT source_id, filename, upload_timestamp FROM pdf_documents ORDER BY upload_timestamp DESC LIMIT 10"
+  - "SELECT source_id, source_kind, publication_year, coverage_start_year, coverage_end_year FROM pdf_documents ORDER BY upload_timestamp DESC LIMIT 10"
   - "SELECT page_id, source_id, page_number FROM pdf_pages ORDER BY source_id, page_number LIMIT 50"
   - "SELECT chunk_id, page_id, chunk_kind FROM pdf_chunks LIMIT 50"

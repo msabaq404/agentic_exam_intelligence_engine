@@ -2,23 +2,51 @@ name: exam_enriched
 version: "0.1.0"
 description: "Coral source exposing the persistent, structured exam intelligence schema produced by enrichment agents. Tables contain enriched questions, textbook chunks, chapter links, topic statistics, pattern clusters, and student performance."
 inputs:
-  EXAM_DB_PATH:
+  PGHOST:
     kind: variable
-    hint: "Path to the persistent structured DB (example: ./data/exam_intel.db)."
+    hint: "PostgreSQL host for the enriched exam database (example: localhost)."
+    required: true
+  PGPORT:
+    kind: variable
+    hint: "PostgreSQL port for the enriched exam database (example: 5432)."
+    required: true
+  PGDATABASE:
+    kind: variable
+    hint: "PostgreSQL database name containing the enriched tables (example: postgres)."
+    required: true
+  PGUSER:
+    kind: variable
+    hint: "PostgreSQL user with read access to the enriched tables (example: postgres)."
+    required: true
+  PGPASSWORD:
+    kind: secret
+    hint: "PostgreSQL password for the enriched database user."
     required: true
 backend:
-  kind: sqlite
-  location: "{{input.EXAM_DB_PATH}}"
+  kind: postgres
+  host: "{{input.PGHOST}}"
+  port: "{{input.PGPORT}}"
+  database: "{{input.PGDATABASE}}"
+  user: "{{input.PGUSER}}"
+  password: "{{input.PGPASSWORD}}"
 
 tables:
   - table_name: exam_questions
-    description: "Structured, enriched question records produced by the enrichment agent."
+    description: "Structured PYQ question records produced by Azure OCR, Docling normalization, and Gemini structural intelligence. Each row should represent one exact question with source location and structured metadata."
     columns:
       - name: question_id
         data_type: Utf8
       - name: source_id
         data_type: Utf8
-      - name: year
+      - name: source_uri
+        data_type: Utf8
+      - name: page_number
+        data_type: Int64
+      - name: question_number
+        data_type: Int64
+      - name: question_text
+        data_type: Utf8
+      - name: exam_year
         data_type: Int64
       - name: topic
         data_type: Utf8
@@ -42,6 +70,8 @@ tables:
         data_type: Float64
       - name: confidence
         data_type: Float64
+      - name: raw_structured_json
+        data_type: Utf8
 
   - table_name: exam_textbook_chunks
     description: "Textbook chunks and their semantic annotations."
@@ -131,4 +161,4 @@ tables:
 
 test_queries:
   - "SELECT topic, frequency FROM exam_topic_statistics ORDER BY frequency DESC LIMIT 20"
-  - "SELECT question_id, topic, importance_score FROM exam_questions ORDER BY importance_score DESC LIMIT 20"
+  - "SELECT question_id, exam_year, topic, importance_score FROM exam_questions ORDER BY importance_score DESC LIMIT 20"

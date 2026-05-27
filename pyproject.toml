@@ -10,6 +10,32 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "psycopg[binary]>=3.2",
+  "fastapi>=0.95",
+  "uvicorn[standard]>=0.22",
+  "python-multipart>=0.0.6",
+  "pymupdf>=1.22.0",
+  "jsonschema>=4.0",
+  "google-genai>=1.0.0,<2.0.0",
+  "azure-ai-documentintelligence>=1.0.2,<2.0.0",
+  "docling>=2.95.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+embeddings = [
+  "sentence-transformers>=2.2.2", 
+  "transformers>=4.30.0",
+  "torch>=2.0.0",
+]
+ocr = [
+  "pytesseract>=0.3.10",
+  "Pillow>=9.0.0",
+]
+vector = [
+  "faiss-cpu>=1.7.4"
+]
+dev = [
+  "pytest",
+  "black",
 ]
 
 [project.scripts]
