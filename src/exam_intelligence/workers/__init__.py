@@ -1,1 +1,1 @@
-"""Worker processes for enrichment pipeline."""
+"""OCR worker entrypoint for the ingestion pipeline."""

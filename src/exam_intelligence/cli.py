@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import json
+import uuid
 
 from .db.db import connect
-from .db.schema import DDL
+from .db.schema import ensure_compatible_schema
+
 
 
 def init_db() -> None:
     with connect() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(DDL)
+        ensure_compatible_schema(connection)
         connection.commit()
 
 
@@ -20,10 +22,18 @@ def main() -> None:
     subparsers.add_parser("run-ocr", help="Run Azure Document Intelligence OCR/layout extraction worker")
     run_pipeline = subparsers.add_parser("run-pipeline", help="Run Azure -> Docling -> embeddings for a source")
     run_pipeline.add_argument("--source-id", required=True, help="Source ID already registered in ingestion.sources")
-    run_enrich = subparsers.add_parser("run-enrich", help="Run enrichment on pending chunks")
-    run_enrich.add_argument("--limit", type=int, default=50)
-    run_enrich.add_argument("--top-k", type=int, default=None, help="If set, enqueue only top-K pending chunks using prioritization heuristic")
-
+    run_embed = subparsers.add_parser("run-embed", help="Run the embedding worker")
+    run_embed.add_argument("--start", action="store_true", help="Run continuously and poll for new jobs")
+    run_embed.add_argument("--once", action="store_true", help="Process one pending job and exit")
+    run_embed.add_argument("--drain", action="store_true", help="Process all pending jobs and exit")
+    run_embed.add_argument("--poll-interval", type=float, default=1.0, help="Polling interval for continuous mode")
+    run_llm = subparsers.add_parser("run-llm", help="Run the LLM worker")
+    run_llm.add_argument("--start", action="store_true", help="Run continuously and poll for new jobs")
+    run_llm.add_argument("--once", action="store_true", help="Process one batch of pending jobs and exit")
+    run_llm.add_argument("--drain", action="store_true", help="Process all pending jobs and exit")
+    run_llm.add_argument("--poll-interval", type=float, default=1.0, help="Polling interval for continuous mode")
+    run_export = subparsers.add_parser("run-export", help="Export for Coral")
+    
     args = parser.parse_args()
 
     if args.command == "init-db":
@@ -33,31 +43,53 @@ def main() -> None:
 
         run_loop()
     elif args.command == "run-pipeline":
-        from .core.pipeline import process_source
+        job_id = uuid.uuid4().hex
+        with connect() as connection:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ingestion.job_queue (job_id, stage, status, payload, created_at) VALUES (%s,%s,%s,%s,NOW())",
+                    (job_id, "ocr", "pending", json.dumps({"source_id": args.source_id})),
+                )
+            connection.commit()
+        print({"job_id": job_id, "source_id": args.source_id, "stage": "ocr", "status": "queued"})
+    elif args.command == "run-embed":
+        from .workers.embed_worker import claim_job, process_job, run_loop
 
-        summary = process_source(args.source_id)
-        print(summary)
-    elif args.command == "run-enrich":
-        # If top_k supplied, use the enqueuer to enqueue prioritized deterministic jobs
-        from .workers import enqueuer
-
-        top_k = args.top_k
-        if top_k is None:
-            # fall back to env var LLM_TOP_K if present
-            import os
-
-            try:
-                top_k = int(os.environ.get("LLM_TOP_K") or 0) or None
-            except Exception:
-                top_k = None
-
-        if top_k:
-            n = enqueuer.enqueue_pending_chunks(batch_limit=args.limit, top_k=top_k)
-            print(f"Enqueued {n} prioritized deterministic jobs (top_k={top_k})")
+        if args.start:
+            run_loop(poll_interval=args.poll_interval)
         else:
-            from .workers.runner import run_enrichment
+            with connect() as connection:
+                if args.once:
+                    job = claim_job(connection)
+                    if job:
+                        process_job(connection, job)
+                else:
+                    while True:
+                        job = claim_job(connection)
+                        if not job:
+                            break
+                        process_job(connection, job)
+    elif args.command == "run-llm":
+        from .workers.llm_worker import claim_jobs, process_job, run_loop
 
-            run_enrichment(limit=args.limit)
+        if args.start:
+            run_loop(poll_interval=args.poll_interval)
+        else:
+            with connect() as connection:
+                if args.once:
+                    jobs = claim_jobs(connection, batch_size=4)
+                    for job in jobs:
+                        process_job(connection, job)
+                else:
+                    while True:
+                        jobs = claim_jobs(connection, batch_size=8)
+                        if not jobs:
+                            break
+                        for job in jobs:
+                            process_job(connection, job)
+    elif args.command == "run-export":
+        from .workers.export_worker import export
+        export()
 
 
 if __name__ == "__main__":

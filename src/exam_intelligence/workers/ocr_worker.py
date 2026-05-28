@@ -5,7 +5,7 @@ import socket
 import time
 from typing import Optional
 
-from ..core.pipeline import process_source
+from ..core.pipeline import _process_source
 from ..db.db import connect
 
 
@@ -56,7 +56,7 @@ def process_job(conn, job: dict) -> None:
         raise RuntimeError("ocr job missing source_id")
 
     try:
-        process_source(source_id)
+        _process_source(source_id)
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE ingestion.job_queue SET status = 'completed', finished_at = NOW() WHERE job_id = %s",

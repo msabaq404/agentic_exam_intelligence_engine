@@ -83,6 +83,10 @@ Output schema:
     ]
 }"""
 
+# Explicit instruction: force canonical enum labels for `question_type` to avoid synonyms.
+# Allowed canonical labels: MCQ, NAT, MSQ, Numerical, Theory
+# Example: use "MCQ" instead of "Multiple Choice"; use "NAT" instead of "Short Answer".
+
 TEXTBOOK_PARSING_PROMPT = """You are a semantic educational parser.
 
 Analyze one textbook chunk and return STRICT JSON only.
@@ -152,7 +156,23 @@ TEXTBOOK_PARSING_JSON_SCHEMA = {
         "main_concept": {"type": "string"},
         "prerequisites": {"type": "array", "items": {"type": "string"}},
         "formulas": {"type": "array", "items": {"type": "string"}},
-        "definitions": {"type": "array", "items": {"type": "string"}},
+        "definitions": {
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    {"type": "string"},
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "term": {"type": "string"},
+                            "definition": {"type": "string"},
+                        },
+                        "required": ["term", "definition"],
+                    },
+                ]
+            },
+        },
         "exam_relevance_score": {"type": "number"},
         "conceptual_importance": {"type": "number"},
         "commonly_examined_concepts": {"type": "array", "items": {"type": "string"}},

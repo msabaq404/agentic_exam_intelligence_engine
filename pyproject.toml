@@ -30,9 +30,6 @@ ocr = [
   "pytesseract>=0.3.10",
   "Pillow>=9.0.0",
 ]
-vector = [
-  "faiss-cpu>=1.7.4"
-]
 dev = [
   "pytest",
   "black",

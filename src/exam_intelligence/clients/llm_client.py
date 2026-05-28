@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Optional, Dict, Any
+
+# import dotenv
+# dotenv.load_dotenv()
 
 try:
     from google import genai
@@ -19,12 +23,10 @@ class SDKClient:
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
-        try:
-            self.client = genai.Client(api_key=api_key)
-        except TypeError:
-            # Some SDK versions may not accept api_key in constructor; set env and create client
-            os.environ["GOOGLE_GENAI_API_KEY"] = api_key
-            self.client = genai.Client()
+        self.client = genai.Client(api_key=api_key)
+        # for model in self.client.models.list():
+        #     print(model.name)
+    
 
     def infer(self, prompt: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         config = None
@@ -36,6 +38,7 @@ class SDKClient:
                 config_kwargs["temperature"] = params["temperature"]
             if "top_p" in params:
                 config_kwargs["top_p"] = params["top_p"]
+            config_kwargs["response_mime_type"] = "application/json"
             if config_kwargs:
                 try:
                     from google.genai import types
@@ -45,18 +48,22 @@ class SDKClient:
                     config = config_kwargs
 
         try:
-            if config is not None:
-                response = self.client.models.generate_content(model=self.model, contents=prompt, config=config)
-            else:
-                response = self.client.models.generate_content(model=self.model, contents=prompt)
-        except Exception as exc:
-            if config is not None:
+            last_exc = None
+            for attempt in range(4):
                 try:
-                    response = self.client.models.generate_content(model=self.model, contents=prompt)
-                except Exception as fallback_exc:
-                    raise RuntimeError(f"google.genai generate_content failed: {fallback_exc}") from fallback_exc
-            else:
-                raise RuntimeError(f"google.genai generate_content failed: {exc}") from exc
+                    if config is not None:
+                        response = self.client.models.generate_content(model=self.model, contents=prompt, config=config)
+                    else:
+                        response = self.client.models.generate_content(model=self.model, contents=prompt)
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < 3:
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise RuntimeError(f"google.genai generate_content failed after retries: {exc}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"google.genai generate_content failed: {exc}") from exc
 
         text = getattr(response, "text", None)
         if text is not None:
@@ -86,5 +93,3 @@ def get_gemini_client() -> SDKClient:
     if not model:
         raise RuntimeError("GOOGLE_GENAI_MODEL is required; set it in .env")
     return SDKClient(api_key=api_key, model=model)
-
-   

@@ -1,32 +1,150 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
+import tempfile
 from pathlib import Path
 from typing import Dict, List
 
-from jsonschema import ValidationError, validate
+import fitz
 
 from ..clients.document_intelligence import analyze_pdf
-from ..clients.embeddings import embed_text
-from ..clients.llm_client import get_gemini_client
-from ..core.contracts import PYQ_EXTRACTION_JSON_SCHEMA, PYQ_EXTRACTION_PROMPT
 from ..db.db import connect
 
 
 QUESTION_START_RE = re.compile(r"(?m)^\s*(?:Q(?:uestion)?\.?\s*)?(?P<number>\d{1,3})[\).:\-]\s+")
 QUESTION_START_AT_LINE_RE = re.compile(r"^\s*(?:Q(?:uestion)?\.?\s*)?(?P<number>\d{1,3})[\).:\-]\s+")
+OPTION_LINE_RE = re.compile(r"(?m)^\s*[A-Da-d][\).:\-]\s+")
+INLINE_OPTION_RE = re.compile(r"(?:^|\s)[A-Da-d][\).:\-]\s+")
+OPTION_BLOCK_RE = re.compile(r"(?m)^(?:\s*[A-Da-d][\).:\-]\s+|.*(?:\b[A-Da-d][\).:\-]\s+).*)$")
 MAX_BATCH_CHARS = 12000
 MAX_BATCH_CANDIDATES = 16
+QUESTION_TYPE_ALIASES = {
+    "multiple choice": "MCQ",
+    "multiple-choice": "MCQ",
+    "mcq": "MCQ",
+    "objective": "MCQ",
+    "nat": "NAT",
+    "msq": "MSQ",
+    "numerical": "Numerical",
+    "theory": "Theory",
+}
 
 
-def _load_docling_markdown(source_uri: str) -> str:
+def _table_exists(conn, schema: str, table: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s",
+            (schema, table),
+        )
+        return cur.fetchone() is not None
+
+
+def _use_azure_ocr() -> bool:
+    return os.getenv("DOCLING_USE_AZURE_OCR", "1").lower() in ("1", "true", "yes")
+
+
+def _docling_markdown_for_page(page_path: Path) -> str:
     from docling.document_converter import DocumentConverter
 
     converter = DocumentConverter()
-    result = converter.convert(Path(source_uri))
+    result = converter.convert(page_path)
+    if not result or not result.document:
+        return ""
     return result.document.export_to_markdown()
+
+
+def _load_docling_markdown(source_uri: str) -> str:
+    # Optionally use Azure Document Intelligence for OCR, then hand the
+    # Azure-derived markdown to Docling for normalization when supported.
+    if _use_azure_ocr():
+        azure_result = analyze_pdf(source_uri)
+        # Build a lightweight markdown from Azure paragraphs/pages.
+        page_texts = _page_text_by_number(azure_result)
+        parts: List[str] = []
+        for pnum in sorted(page_texts.keys()):
+            parts.append(f"## Page {pnum}")
+            parts.append(page_texts[pnum])
+        azure_markdown = "\n\n".join(parts)
+
+        from docling.document_converter import DocumentConverter
+
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as tmp:
+            tmp.write(azure_markdown)
+            tmp_path = Path(tmp.name)
+        try:
+            converter = DocumentConverter()
+            result = converter.convert(tmp_path)
+            return result.document.export_to_markdown()
+        finally:
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
+    source_path = Path(source_uri)
+    markdown_parts: List[str] = []
+
+    with fitz.open(str(source_path)) as doc:
+        for page_index in range(doc.page_count):
+            with tempfile.NamedTemporaryFile(suffix=f".page{page_index + 1}.png", delete=False) as tmp:
+                page_path = Path(tmp.name)
+
+            page = doc.load_page(page_index)
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+            pix.save(str(page_path))
+
+            try:
+                page_markdown = _docling_markdown_for_page(page_path)
+            except Exception:
+                page_markdown = ""
+            finally:
+                try:
+                    page_path.unlink()
+                except Exception:
+                    pass
+
+            if not page_markdown.strip():
+                try:
+                    page_markdown = doc.load_page(page_index).get_text("text") or ""
+                except Exception:
+                    page_markdown = ""
+
+            if page_markdown.strip():
+                markdown_parts.append(f"## Page {page_index + 1}\n\n{page_markdown.strip()}")
+
+    return "\n\n".join(markdown_parts)
+
+
+def _local_page_text_by_number(source_uri: str) -> Dict[int, str]:
+    page_texts: Dict[int, str] = {}
+    source_path = Path(source_uri)
+
+    with fitz.open(str(source_path)) as doc:
+        for page_index in range(doc.page_count):
+            with tempfile.NamedTemporaryFile(suffix=f".page{page_index + 1}.png", delete=False) as tmp:
+                page_path = Path(tmp.name)
+
+            page = doc.load_page(page_index)
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+            pix.save(str(page_path))
+
+            try:
+                page_markdown = _docling_markdown_for_page(page_path)
+            except Exception:
+                page_markdown = ""
+            finally:
+                try:
+                    page_path.unlink()
+                except Exception:
+                    pass
+
+            if page_markdown.strip():
+                page_texts[page_index + 1] = page_markdown.strip()
+
+    return page_texts
 
 
 def _page_text_by_number(azure_result) -> Dict[int, str]:
@@ -87,20 +205,113 @@ def _looks_like_question(text: str) -> bool:
     return score >= 3
 
 
+def _looks_like_option_block(text: str) -> bool:
+    option_hits = len(OPTION_LINE_RE.findall(text)) + len(INLINE_OPTION_RE.findall(text))
+    words = text.split()
+    return option_hits >= 2 or (option_hits >= 1 and len(words) <= 20)
+
+
+def _looks_like_stem_with_following_options(text: str, next_text: str | None) -> bool:
+    if not text or _looks_like_option_block(text):
+        return False
+    if next_text and _looks_like_option_block(next_text):
+        return len(text.split()) >= 5 and len(text) >= 30
+    return _looks_like_question(text)
+
+
+def _question_stem_from_candidate(text: str) -> str:
+    inline_match = INLINE_OPTION_RE.search(text)
+    if inline_match and inline_match.start() > 0:
+        stem = text[: inline_match.start()].strip()
+        stem = re.sub(r"\s+", " ", stem).strip(" :-")
+        if stem:
+            return stem
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    stem_lines: List[str] = []
+    for line in lines:
+        if OPTION_LINE_RE.match(line):
+            break
+        stem_lines.append(line)
+    stem = re.sub(r"\s+", " ", " ".join(stem_lines)).strip()
+    return stem or re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_question_text(candidate_text: str, extracted_text: str) -> str:
+    extracted_clean = re.sub(r"\s+", " ", (extracted_text or "")).strip()
+    candidate_clean = re.sub(r"\s+", " ", (candidate_text or "")).strip()
+
+    if not extracted_clean:
+        return _question_stem_from_candidate(candidate_text)
+
+    extracted_option_count = len(OPTION_LINE_RE.findall(extracted_text or "")) + len(INLINE_OPTION_RE.findall(extracted_text or ""))
+    candidate_option_count = len(OPTION_LINE_RE.findall(candidate_text or "")) + len(INLINE_OPTION_RE.findall(candidate_text or ""))
+    extracted_looks_like_options = extracted_option_count >= 2 or (
+        extracted_option_count >= 1 and len(extracted_clean) < 120 and not re.search(r"[?.]", extracted_clean)
+    )
+
+    # If the extracted text appears to contain option lines, prefer the
+    # extracted text (it preserves the option block). If the candidate
+    # contains options and the extractor returned the full candidate, keep
+    # the candidate (to preserve formatting produced by Docling).
+    if extracted_looks_like_options:
+        return extracted_clean
+
+    if candidate_option_count >= 2 and extracted_clean == candidate_clean:
+        return candidate_clean
+
+    return extracted_clean
+
+
+def _normalize_question_type(value: str) -> str:
+    normalized = re.sub(r"[\s_\-]+", " ", (value or "")).strip().lower()
+    # direct alias
+    if normalized in QUESTION_TYPE_ALIASES:
+        return QUESTION_TYPE_ALIASES[normalized]
+    # handle common verbose phrases
+    if "multiple choice" in normalized or ("multiple" in normalized and "choice" in normalized):
+        return "MCQ"
+    if "multiple choice question" in normalized:
+        return "MCQ"
+    if "short answer" in normalized or ("short" in normalized and "answer" in normalized):
+        return "NAT"
+    if "multiple select" in normalized or ("multiple" in normalized and "select" in normalized):
+        return "MSQ"
+    # fallback to original value if no mapping
+    return value
+
+
 def _candidate_blocks_for_page(page_number: int, text: str) -> List[dict]:
     blocks = []
-    for index, block in enumerate(_split_numbered_blocks(text), start=1):
-        block_text = re.sub(r"\s+", " ", block["text"]).strip()
-        if not block_text or not _looks_like_question(block_text):
+    paragraphs = [paragraph.strip() for paragraph in re.split(r"\n{2,}", text) if paragraph.strip()]
+    index = 0
+    block_index = 1
+    while index < len(paragraphs):
+        paragraph = paragraphs[index]
+        next_paragraph = paragraphs[index + 1] if index + 1 < len(paragraphs) else None
+
+        if _looks_like_stem_with_following_options(paragraph, next_paragraph):
+            block_parts = [paragraph]
+            lookahead = index + 1
+            while lookahead < len(paragraphs) and _looks_like_option_block(paragraphs[lookahead]):
+                block_parts.append(paragraphs[lookahead])
+                lookahead += 1
+
+            block_text = re.sub(r"\s+", " ", "\n\n".join(block_parts)).strip()
+            if block_text:
+                blocks.append(
+                    {
+                        "candidate_id": f"p{page_number}-b{block_index}",
+                        "page_number": page_number,
+                        "question_number_hint": None,
+                        "text": block_text,
+                    }
+                )
+                block_index += 1
+            index = lookahead
             continue
-        blocks.append(
-            {
-                "candidate_id": f"p{page_number}-b{index}",
-                "page_number": page_number,
-                "question_number_hint": block["question_number_hint"],
-                "text": block_text,
-            }
-        )
+
+        index += 1
     return blocks
 
 
@@ -160,140 +371,120 @@ def _batch_candidates(candidates: List[dict]) -> List[List[dict]]:
     return batches
 
 
-def _build_extraction_prompt(source_kind: str, source_uri: str, candidates: List[dict]) -> str:
-    candidate_lines = []
-    for candidate in candidates:
-        candidate_lines.append(
-            "\n".join(
-                [
-                    f"CANDIDATE_ID: {candidate['candidate_id']}",
-                    f"PAGE_NUMBER: {candidate['page_number']}",
-                    f"QUESTION_NUMBER_HINT: {candidate['question_number_hint']}",
-                    "TEXT:",
-                    candidate["text"],
-                ]
-            )
-        )
-
-    return (
-        f"{PYQ_EXTRACTION_PROMPT}\n\n"
-        f"SOURCE_KIND: {source_kind}\n"
-        f"SOURCE_URI: {source_uri}\n\n"
-        "CANDIDATE_BLOCKS:\n"
-        + "\n\n---\n\n".join(candidate_lines)
+def _enqueue_job(cur, *, chunk_id: str, stage: str, source_id: str) -> str:
+    job_id = uuid.uuid4().hex
+    cur.execute(
+        "INSERT INTO ingestion.job_queue (job_id, chunk_id, stage, status, payload, created_at) VALUES (%s,%s,%s,%s,%s,NOW())",
+        (job_id, chunk_id, stage, "pending", json.dumps({"source_id": source_id})),
     )
+    return job_id
 
 
-def _extract_pyq_rows(source_kind: str, source_uri: str, page_texts: Dict[int, str]) -> List[dict]:
-    docling_markdown = _load_docling_markdown(source_uri)
-    candidates = _extract_candidate_blocks(page_texts, docling_markdown)
-    if not candidates:
-        return []
+def _build_source_chunks(source_kind: str, page_texts: Dict[int, str], docling_markdown: str) -> List[dict]:
+    normalized_kind = (source_kind or "").strip().lower()
+    chunks: List[dict] = []
 
-    client = get_gemini_client()
-    all_questions: List[dict] = []
+    if normalized_kind in {"pyq", "question", "mcq", "nq"}:
+        candidates = _extract_candidate_blocks(page_texts, docling_markdown)
+        if not candidates:
+            for index, block in enumerate(_split_numbered_blocks(docling_markdown), start=1):
+                block_text = re.sub(r"\s+", " ", block["text"]).strip()
+                if not block_text or not _looks_like_question(block_text):
+                    continue
+                candidates.append(
+                    {
+                        "candidate_id": f"docling-b{index}",
+                        "page_number": None,
+                        "question_number_hint": block["question_number_hint"],
+                        "text": block_text,
+                    }
+                )
 
-    for batch in _batch_candidates(candidates):
-        prompt = _build_extraction_prompt(source_kind, source_uri, batch)
-        response = client.infer(prompt, params={"max_tokens": 1400, "temperature": 0.0})
-        raw_text = response.get("text", "") if isinstance(response, dict) else str(response)
-        parsed = json.loads(raw_text)
-        validate(instance=parsed, schema=PYQ_EXTRACTION_JSON_SCHEMA)
-        all_questions.extend(parsed["questions"])
-
-    return all_questions
-
-
-def _insert_question_rows(conn, source_id: str, source_uri: str, page_id_by_number: Dict[int, str], questions: List[dict]) -> dict:
-    inserted = 0
-    with conn.cursor() as cur:
-        for question in questions:
-            question_id = uuid.uuid4().hex
-            question_text = (question.get("question_text") or "").strip()
-            if not question_text:
-                continue
-
-            page_number = question.get("page_number")
-            chunk_id = uuid.uuid4().hex
-            page_id = page_id_by_number.get(page_number) if page_number is not None else None
-            if page_id is None and page_id_by_number:
-                page_id = next(iter(page_id_by_number.values()))
-
-            cur.execute(
-                "INSERT INTO ingestion.pdf_chunks (chunk_id, page_id, source_id, chunk_order, chunk_text, chunk_kind, extracted_entities_json, enrichment_status, enriched_question_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (
-                    chunk_id,
-                    page_id,
-                    source_id,
-                    inserted,
-                    question_text,
-                    "question",
-                    json.dumps(question),
-                    "embedded",
-                    question_id,
-                ),
+        for candidate in candidates:
+            chunks.append(
+                {
+                    "page_number": candidate.get("page_number"),
+                    "chunk_text": candidate["text"],
+                    "chunk_kind": "question",
+                }
             )
+        return chunks
 
-            cur.execute(
-                "INSERT INTO exam.questions (question_id, source_id, source_uri, page_number, question_number, question_text, exam_year, topic, subtopic, difficulty, question_type, concepts_json, prerequisites_json, semantic_tags_json, pattern_type, conceptual_depth, importance_score, confidence, raw_structured_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (
-                    question_id,
-                    source_id,
-                    source_uri,
-                    page_number,
-                    question.get("question_number"),
-                    question_text,
-                    question.get("exam_year"),
-                    question.get("topic", ""),
-                    question.get("subtopic"),
-                    question.get("difficulty", "Medium"),
-                    question.get("question_type", "Theory"),
-                    json.dumps(question.get("concepts", [])),
-                    json.dumps(question.get("prerequisites", [])),
-                    json.dumps(question.get("semantic_tags", [])),
-                    question.get("pattern_type"),
-                    question.get("conceptual_depth", 0.0),
-                    question.get("importance_score", 0.0),
-                    question.get("confidence", 0.0),
-                    json.dumps(question),
-                ),
-            )
-
-            vector = embed_text(question_text)
-            cur.execute(
-                "INSERT INTO ingestion.embeddings (embedding_id, chunk_id, model, vector, score, created_at) VALUES (%s,%s,%s,%s,%s,NOW())",
-                (
-                    uuid.uuid4().hex,
-                    chunk_id,
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                    json.dumps(vector),
-                    None,
-                ),
-            )
-            inserted += 1
-
-    return {"questions": inserted}
+    for page_number, page_text in sorted(page_texts.items()):
+        cleaned = re.sub(r"\s+", " ", page_text).strip()
+        if cleaned:
+            chunks.append({"page_number": page_number, "chunk_text": cleaned, "chunk_kind": "textbook"})
+    return chunks
 
 
-def process_source(source_id: str, *, rebuild: bool = True) -> dict:
+def _process_source(source_id: str, *, rebuild: bool = True) -> dict:
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT source_uri, source_kind, filename FROM ingestion.sources WHERE source_id = %s",
-                (source_id,),
+                "SELECT column_name FROM information_schema.columns WHERE table_schema='ingestion' AND table_name='sources' AND column_name IN ('source_kind','source_type','filename','source_uri')"
             )
-            row = cur.fetchone()
-            if not row:
-                raise RuntimeError(f"source not found: {source_id}")
-            source_uri, source_kind, filename = row
+            existing = {r[0] for r in cur.fetchall()}
 
-    azure_result = analyze_pdf(source_uri)
-    page_texts = _page_text_by_number(azure_result)
+            if 'source_kind' in existing and 'filename' in existing:
+                cur.execute(
+                    "SELECT source_uri, source_kind, filename FROM ingestion.sources WHERE source_id = %s",
+                    (source_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise RuntimeError(f"source not found: {source_id}")
+                source_uri, source_kind, filename = row
+            elif 'source_type' in existing:
+                cur.execute(
+                    "SELECT source_uri, source_type, NULL AS filename FROM ingestion.sources WHERE source_id = %s",
+                    (source_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise RuntimeError(f"source not found: {source_id}")
+                source_uri, source_kind, filename = row
+            else:
+                cur.execute(
+                    "SELECT source_uri, NULL AS source_kind, NULL AS filename FROM ingestion.sources WHERE source_id = %s",
+                    (source_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise RuntimeError(f"source not found: {source_id}")
+                source_uri, source_kind, filename = row
+
+            if not filename:
+                try:
+                    from pathlib import Path
+
+                    filename = Path(source_uri).name
+                except Exception:
+                    filename = source_uri
+
+    if _use_azure_ocr():
+        azure_result = analyze_pdf(source_uri)
+        page_texts = _page_text_by_number(azure_result)
+        pages = list(getattr(azure_result, "pages", None) or [])
+        docling_markdown = _load_docling_markdown(source_uri)
+    else:
+        page_texts = _local_page_text_by_number(source_uri)
+        pages = [type("Page", (), {"page_number": page_number, "lines": [], "words": []}) for page_number in sorted(page_texts.keys())]
+        docling_markdown = "\n\n".join(
+            f"## Page {page_number}\n\n{page_text.strip()}"
+            for page_number, page_text in sorted(page_texts.items())
+            if page_text.strip()
+        )
 
     if rebuild:
         with connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM ingestion.embeddings WHERE chunk_id IN (SELECT chunk_id FROM ingestion.pdf_chunks WHERE source_id = %s)", (source_id,))
+                if _table_exists(conn, "ingestion", "embeddings"):
+                    cur.execute("DELETE FROM ingestion.embeddings WHERE chunk_id IN (SELECT chunk_id FROM ingestion.pdf_chunks WHERE source_id = %s)", (source_id,))
+                if _table_exists(conn, "ingestion", "llm_cache"):
+                    cur.execute("DELETE FROM ingestion.llm_cache WHERE cache_key IN (SELECT prompt_hash FROM ingestion.raw_llm_outputs WHERE chunk_id IN (SELECT chunk_id FROM ingestion.pdf_chunks WHERE source_id = %s))", (source_id,))
+                if _table_exists(conn, "ingestion", "raw_llm_outputs"):
+                    cur.execute("DELETE FROM ingestion.raw_llm_outputs WHERE chunk_id IN (SELECT chunk_id FROM ingestion.pdf_chunks WHERE source_id = %s)", (source_id,))
+                cur.execute("DELETE FROM ingestion.job_queue WHERE chunk_id IN (SELECT chunk_id FROM ingestion.pdf_chunks WHERE source_id = %s)", (source_id,))
                 cur.execute("DELETE FROM exam.questions WHERE source_id = %s", (source_id,))
                 cur.execute("DELETE FROM ingestion.pdf_chunks WHERE source_id = %s", (source_id,))
                 cur.execute("DELETE FROM ingestion.ocr_artifacts WHERE page_id IN (SELECT page_id FROM ingestion.pdf_pages WHERE source_id = %s)", (source_id,))
@@ -303,7 +494,7 @@ def process_source(source_id: str, *, rebuild: bool = True) -> dict:
     page_id_by_number: Dict[int, str] = {}
     with connect() as conn:
         with conn.cursor() as cur:
-            for page in getattr(azure_result, "pages", None) or []:
+            for page in pages:
                 page_number = getattr(page, "page_number", None)
                 if page_number is None:
                     continue
@@ -326,18 +517,36 @@ def process_source(source_id: str, *, rebuild: bool = True) -> dict:
                     "INSERT INTO ingestion.ocr_artifacts (artifact_id, page_id, ocr_text, ocr_confidence, layout_json) VALUES (%s,%s,%s,%s,%s)",
                     (uuid.uuid4().hex, page_id, page_text, None, json.dumps(layout_json)),
                 )
+
+            chunks = _build_source_chunks(source_kind, page_texts, docling_markdown)
+            for index, chunk in enumerate(chunks):
+                chunk_id = uuid.uuid4().hex
+                page_number = chunk.get("page_number")
+                page_id = page_id_by_number.get(page_number) if page_number is not None else None
+                if page_id is None and page_id_by_number:
+                    page_id = next(iter(page_id_by_number.values()))
+                cur.execute(
+                    "INSERT INTO ingestion.pdf_chunks (chunk_id, page_id, source_id, chunk_order, chunk_text, chunk_kind, extracted_entities_json, enrichment_status, enriched_question_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        chunk_id,
+                        page_id,
+                        source_id,
+                        index,
+                        chunk["chunk_text"],
+                        chunk["chunk_kind"],
+                        json.dumps({"source_kind": source_kind, "page_number": page_number}),
+                        "pending",
+                        None,
+                    ),
+                )
+                _enqueue_job(cur, chunk_id=chunk_id, stage="llm", source_id=source_id)
+                _enqueue_job(cur, chunk_id=chunk_id, stage="embed", source_id=source_id)
             conn.commit()
-
-    questions = _extract_pyq_rows(source_kind, source_uri, page_texts)
-
-    with connect() as conn:
-        summary = _insert_question_rows(conn, source_id, source_uri, page_id_by_number, questions)
-        conn.commit()
 
     return {
         "source_id": source_id,
         "source_uri": source_uri,
-        "questions": summary["questions"],
-        "embeddings": summary["questions"],
-        "pipeline": "azure_ocr -> docling_candidate_split -> gemini_micro_batch -> embeddings",
+        "chunks": len(chunks),
+        "jobs_enqueued": len(chunks) * 2,
+        "pipeline": "azure_ocr -> docling_chunking -> llm_worker/embed_worker",
     }

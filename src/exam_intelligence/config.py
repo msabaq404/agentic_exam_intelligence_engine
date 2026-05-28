@@ -20,6 +20,7 @@ def load() -> None:
     must exist; otherwise startup fails loudly so missing configuration is
     obvious.
     """
+    os.environ["ROOT"] = str(ROOT)
     env_path = ROOT / ".env"
     if not env_path.exists():
         raise RuntimeError(
