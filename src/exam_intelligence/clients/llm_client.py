@@ -2,15 +2,38 @@ from __future__ import annotations
 
 import os
 import time
+import threading
 from typing import Optional, Dict, Any
 
-# import dotenv
-# dotenv.load_dotenv()
+import dotenv
+dotenv.load_dotenv()
 
 try:
     from google import genai
 except Exception as exc:
     raise ImportError("google-genai SDK is required. Install it with: pip install google-genai") from exc
+
+
+_RATE_LIMIT_LOCK = threading.Lock()
+_NEXT_REQUEST_AT = 0.0
+
+
+def _rate_limit_delay(max_rpm: int) -> float:
+    if max_rpm <= 0:
+        return 0.0
+
+    interval = 60.0 / float(max_rpm)
+    now = time.monotonic()
+
+    with _RATE_LIMIT_LOCK:
+        global _NEXT_REQUEST_AT
+        if _NEXT_REQUEST_AT <= now:
+            _NEXT_REQUEST_AT = now + interval
+            return 0.0
+
+        delay = _NEXT_REQUEST_AT - now
+        _NEXT_REQUEST_AT = _NEXT_REQUEST_AT + interval
+        return delay
 
 
 class SDKClient:
@@ -24,8 +47,8 @@ class SDKClient:
         self.model = model
         self.timeout = timeout
         self.client = genai.Client(api_key=api_key)
-        # for model in self.client.models.list():
-        #     print(model.name)
+        for model in self.client.models.list():
+            print(model.name)
     
 
     def infer(self, prompt: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -49,8 +72,12 @@ class SDKClient:
 
         try:
             last_exc = None
+            max_rpm = int(os.getenv("GOOGLE_GENAI_MAX_RPM", "10"))
             for attempt in range(4):
                 try:
+                    delay = _rate_limit_delay(max_rpm)
+                    if delay > 0:
+                        time.sleep(delay)
                     if config is not None:
                         response = self.client.models.generate_content(model=self.model, contents=prompt, config=config)
                     else:
@@ -93,3 +120,5 @@ def get_gemini_client() -> SDKClient:
     if not model:
         raise RuntimeError("GOOGLE_GENAI_MODEL is required; set it in .env")
     return SDKClient(api_key=api_key, model=model)
+
+get_gemini_client()

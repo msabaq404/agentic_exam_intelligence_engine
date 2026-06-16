@@ -10,7 +10,7 @@ from typing import Dict, List
 
 import fitz
 
-from ..clients.document_intelligence import analyze_pdf
+from ..clients.document_intelligence import analyze_pdf, analyze_pdf_batches
 from ..db.db import connect
 
 
@@ -141,8 +141,18 @@ def _local_page_text_by_number(source_uri: str) -> Dict[int, str]:
                 except Exception:
                     pass
 
-            if page_markdown.strip():
+            # Always include the page in the returned mapping. Prefer
+            # Docling-normalized markdown when available; otherwise fall
+            # back to the raw text extractor so every page is represented
+            # (possibly as an empty string) and will be persisted to the DB.
+            if page_markdown and page_markdown.strip():
                 page_texts[page_index + 1] = page_markdown.strip()
+            else:
+                try:
+                    raw = doc.load_page(page_index).get_text("text") or ""
+                except Exception:
+                    raw = ""
+                page_texts[page_index + 1] = raw.strip()
 
     return page_texts
 
@@ -170,6 +180,47 @@ def _page_text_by_number(azure_result) -> Dict[int, str]:
             lines = [getattr(line, "content", "") or "" for line in getattr(page, "lines", None) or []]
             page_texts[page_number] = "\n".join(line.strip() for line in lines if line.strip())
     return page_texts
+
+
+def _offset_azure_result(azure_result, page_offset: int):
+    pages = []
+    for page in getattr(azure_result, "pages", None) or []:
+        pages.append(
+            type(
+                "Page",
+                (),
+                {
+                    "page_number": getattr(page, "page_number", 0) + page_offset,
+                    "lines": getattr(page, "lines", None) or [],
+                    "words": getattr(page, "words", None) or [],
+                },
+            )
+        )
+
+    paragraphs = []
+    for paragraph in getattr(azure_result, "paragraphs", None) or []:
+        regions = []
+        for region in getattr(paragraph, "bounding_regions", None) or []:
+            regions.append(
+                type(
+                    "Region",
+                    (),
+                    {"page_number": getattr(region, "page_number", 0) + page_offset},
+                )
+            )
+        paragraphs.append(
+            type(
+                "Paragraph",
+                (),
+                {
+                    "content": getattr(paragraph, "content", "") or "",
+                    "bounding_regions": regions,
+                    "spans": getattr(paragraph, "spans", None) or [],
+                },
+            )
+        )
+
+    return type("AzureBatchResult", (), {"pages": pages, "paragraphs": paragraphs})()
 
 
 def _split_numbered_blocks(text: str) -> List[dict]:
@@ -265,20 +316,54 @@ def _normalize_question_text(candidate_text: str, extracted_text: str) -> str:
 
 def _normalize_question_type(value: str) -> str:
     normalized = re.sub(r"[\s_\-]+", " ", (value or "")).strip().lower()
-    # direct alias
+
+    # Prefer explicit aliases first
     if normalized in QUESTION_TYPE_ALIASES:
         return QUESTION_TYPE_ALIASES[normalized]
-    # handle common verbose phrases
-    if "multiple choice" in normalized or ("multiple" in normalized and "choice" in normalized):
+
+    # Tokenize on common separators
+    tokens = re.split(r"[\s/,_\\]+", normalized)
+
+    # Direct canonical matches
+    for t in tokens:
+        if t in ("mcq", "multiple", "multiplechoice", "multiplechoicequestion", "multiple choice"):
+            return "MCQ"
+        if t in ("msq", "multiple-select", "multipleselect", "multiple select"):
+            return "MSQ"
+        if t in ("nat", "short", "shortanswer", "short answer"):
+            return "NAT"
+        if t in ("numerical", "num", "calculation", "numer", "numerics"):
+            return "Numerical"
+        if t in ("theory", "conceptual", "essay"):
+            return "Theory"
+
+    # Substring heuristics for compound labels (e.g. "Numerical/Design")
+    if "numer" in normalized or "calcu" in normalized or "design" in normalized:
+        return "Numerical"
+    if "multiple" in normalized and "choice" in normalized:
         return "MCQ"
-    if "multiple choice question" in normalized:
-        return "MCQ"
-    if "short answer" in normalized or ("short" in normalized and "answer" in normalized):
+    if "short" in normalized or "nat" in normalized:
         return "NAT"
-    if "multiple select" in normalized or ("multiple" in normalized and "select" in normalized):
+    if "select" in normalized and "multiple" in normalized:
         return "MSQ"
-    # fallback to original value if no mapping
-    return value
+    if "theory" in normalized or "concept" in normalized:
+        return "Theory"
+
+    # As a final fallback, map any value containing one of the canonical words
+    if any(k in normalized for k in ["mcq", "nat", "msq", "numer", "theory"]):
+        if "mcq" in normalized or "multiple" in normalized:
+            return "MCQ"
+        if "msq" in normalized or "select" in normalized:
+            return "MSQ"
+        if "nat" in normalized or "short" in normalized:
+            return "NAT"
+        if "numer" in normalized:
+            return "Numerical"
+        if "theory" in normalized:
+            return "Theory"
+
+    # Never return an unknown label — default to Theory to keep schema strict.
+    return "Theory"
 
 
 def _candidate_blocks_for_page(page_number: int, text: str) -> List[dict]:
@@ -417,7 +502,77 @@ def _build_source_chunks(source_kind: str, page_texts: Dict[int, str], docling_m
     return chunks
 
 
-def _process_source(source_id: str, *, rebuild: bool = True) -> dict:
+def _existing_page_numbers(conn, source_id: str) -> set[int]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT page_number FROM ingestion.pdf_pages WHERE source_id = %s", (source_id,))
+        return {row[0] for row in cur.fetchall()}
+
+
+def _commit_page_batch(
+    conn,
+    *,
+    source_id: str,
+    source_kind: str,
+    filename: str,
+    pages: List[object],
+    page_texts: Dict[int, str],
+    existing_page_numbers: set[int],
+) -> int:
+    inserted_chunks = 0
+    with conn.cursor() as cur:
+        for page in pages:
+            page_number = getattr(page, "page_number", None)
+            if page_number is None or page_number in existing_page_numbers:
+                continue
+
+            page_text = (page_texts.get(page_number) or "").strip()
+            page_id = uuid.uuid4().hex
+            cur.execute(
+                "INSERT INTO ingestion.pdf_pages (page_id, source_id, page_number, page_text, ocr_confidence) VALUES (%s,%s,%s,%s,%s)",
+                (page_id, source_id, page_number, page_text, None),
+            )
+            layout_json = {
+                "source_kind": source_kind,
+                "filename": filename,
+                "page_number": page_number,
+                "azure_line_count": len(getattr(page, "lines", None) or []),
+                "azure_word_count": len(getattr(page, "words", None) or []),
+                "docling_normalized": True,
+            }
+            cur.execute(
+                "INSERT INTO ingestion.ocr_artifacts (artifact_id, page_id, ocr_text, ocr_confidence, layout_json) VALUES (%s,%s,%s,%s,%s)",
+                (uuid.uuid4().hex, page_id, page_text, None, json.dumps(layout_json)),
+            )
+
+            page_chunks = _build_source_chunks(source_kind, {page_number: page_text}, f"## Page {page_number}\n\n{page_text}".strip())
+            for index, chunk in enumerate(page_chunks):
+                chunk_id = uuid.uuid4().hex
+                cur.execute(
+                    "INSERT INTO ingestion.pdf_chunks (chunk_id, page_id, source_id, chunk_order, chunk_text, chunk_kind, extracted_entities_json, enrichment_status, enriched_question_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        chunk_id,
+                        page_id,
+                        source_id,
+                        index,
+                        chunk["chunk_text"],
+                        chunk["chunk_kind"],
+                        json.dumps({"source_kind": source_kind, "page_number": page_number}),
+                        "pending",
+                        None,
+                    ),
+                )
+                _enqueue_job(cur, chunk_id=chunk_id, stage="llm", source_id=source_id)
+                _enqueue_job(cur, chunk_id=chunk_id, stage="embed", source_id=source_id)
+                inserted_chunks += 1
+
+            existing_page_numbers.add(page_number)
+
+        conn.commit()
+
+    return inserted_chunks
+
+
+def _process_source(source_id: str, *, rebuild: bool = False) -> dict:
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -461,92 +616,43 @@ def _process_source(source_id: str, *, rebuild: bool = True) -> dict:
                 except Exception:
                     filename = source_uri
 
+    with connect() as conn:
+        existing_page_numbers = _existing_page_numbers(conn, source_id)
+
+    inserted_chunks = 0
     if _use_azure_ocr():
-        azure_result = analyze_pdf(source_uri)
-        page_texts = _page_text_by_number(azure_result)
-        pages = list(getattr(azure_result, "pages", None) or [])
-        docling_markdown = _load_docling_markdown(source_uri)
+        for start_page, batch_result in analyze_pdf_batches(source_uri):
+            offset_result = _offset_azure_result(batch_result, start_page)
+            page_texts = _page_text_by_number(offset_result)
+            pages = list(getattr(offset_result, "pages", None) or [])
+            with connect() as conn:
+                inserted_chunks += _commit_page_batch(
+                    conn,
+                    source_id=source_id,
+                    source_kind=source_kind,
+                    filename=filename,
+                    pages=pages,
+                    page_texts=page_texts,
+                    existing_page_numbers=existing_page_numbers,
+                )
     else:
         page_texts = _local_page_text_by_number(source_uri)
         pages = [type("Page", (), {"page_number": page_number, "lines": [], "words": []}) for page_number in sorted(page_texts.keys())]
-        docling_markdown = "\n\n".join(
-            f"## Page {page_number}\n\n{page_text.strip()}"
-            for page_number, page_text in sorted(page_texts.items())
-            if page_text.strip()
-        )
-
-    if rebuild:
         with connect() as conn:
-            with conn.cursor() as cur:
-                if _table_exists(conn, "ingestion", "embeddings"):
-                    cur.execute("DELETE FROM ingestion.embeddings WHERE chunk_id IN (SELECT chunk_id FROM ingestion.pdf_chunks WHERE source_id = %s)", (source_id,))
-                if _table_exists(conn, "ingestion", "llm_cache"):
-                    cur.execute("DELETE FROM ingestion.llm_cache WHERE cache_key IN (SELECT prompt_hash FROM ingestion.raw_llm_outputs WHERE chunk_id IN (SELECT chunk_id FROM ingestion.pdf_chunks WHERE source_id = %s))", (source_id,))
-                if _table_exists(conn, "ingestion", "raw_llm_outputs"):
-                    cur.execute("DELETE FROM ingestion.raw_llm_outputs WHERE chunk_id IN (SELECT chunk_id FROM ingestion.pdf_chunks WHERE source_id = %s)", (source_id,))
-                cur.execute("DELETE FROM ingestion.job_queue WHERE chunk_id IN (SELECT chunk_id FROM ingestion.pdf_chunks WHERE source_id = %s)", (source_id,))
-                cur.execute("DELETE FROM exam.questions WHERE source_id = %s", (source_id,))
-                cur.execute("DELETE FROM ingestion.pdf_chunks WHERE source_id = %s", (source_id,))
-                cur.execute("DELETE FROM ingestion.ocr_artifacts WHERE page_id IN (SELECT page_id FROM ingestion.pdf_pages WHERE source_id = %s)", (source_id,))
-                cur.execute("DELETE FROM ingestion.pdf_pages WHERE source_id = %s", (source_id,))
-                conn.commit()
-
-    page_id_by_number: Dict[int, str] = {}
-    with connect() as conn:
-        with conn.cursor() as cur:
-            for page in pages:
-                page_number = getattr(page, "page_number", None)
-                if page_number is None:
-                    continue
-                page_text = page_texts.get(page_number, "")
-                page_id = uuid.uuid4().hex
-                page_id_by_number[page_number] = page_id
-                cur.execute(
-                    "INSERT INTO ingestion.pdf_pages (page_id, source_id, page_number, page_text, ocr_confidence) VALUES (%s,%s,%s,%s,%s)",
-                    (page_id, source_id, page_number, page_text, None),
-                )
-                layout_json = {
-                    "source_kind": source_kind,
-                    "filename": filename,
-                    "page_number": page_number,
-                    "azure_line_count": len(getattr(page, "lines", None) or []),
-                    "azure_word_count": len(getattr(page, "words", None) or []),
-                    "docling_normalized": True,
-                }
-                cur.execute(
-                    "INSERT INTO ingestion.ocr_artifacts (artifact_id, page_id, ocr_text, ocr_confidence, layout_json) VALUES (%s,%s,%s,%s,%s)",
-                    (uuid.uuid4().hex, page_id, page_text, None, json.dumps(layout_json)),
-                )
-
-            chunks = _build_source_chunks(source_kind, page_texts, docling_markdown)
-            for index, chunk in enumerate(chunks):
-                chunk_id = uuid.uuid4().hex
-                page_number = chunk.get("page_number")
-                page_id = page_id_by_number.get(page_number) if page_number is not None else None
-                if page_id is None and page_id_by_number:
-                    page_id = next(iter(page_id_by_number.values()))
-                cur.execute(
-                    "INSERT INTO ingestion.pdf_chunks (chunk_id, page_id, source_id, chunk_order, chunk_text, chunk_kind, extracted_entities_json, enrichment_status, enriched_question_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (
-                        chunk_id,
-                        page_id,
-                        source_id,
-                        index,
-                        chunk["chunk_text"],
-                        chunk["chunk_kind"],
-                        json.dumps({"source_kind": source_kind, "page_number": page_number}),
-                        "pending",
-                        None,
-                    ),
-                )
-                _enqueue_job(cur, chunk_id=chunk_id, stage="llm", source_id=source_id)
-                _enqueue_job(cur, chunk_id=chunk_id, stage="embed", source_id=source_id)
-            conn.commit()
+            inserted_chunks += _commit_page_batch(
+                conn,
+                source_id=source_id,
+                source_kind=source_kind,
+                filename=filename,
+                pages=pages,
+                page_texts=page_texts,
+                existing_page_numbers=existing_page_numbers,
+            )
 
     return {
         "source_id": source_id,
         "source_uri": source_uri,
-        "chunks": len(chunks),
-        "jobs_enqueued": len(chunks) * 2,
+        "chunks": inserted_chunks,
+        "jobs_enqueued": inserted_chunks * 2,
         "pipeline": "azure_ocr -> docling_chunking -> llm_worker/embed_worker",
     }

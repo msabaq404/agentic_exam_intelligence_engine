@@ -66,41 +66,52 @@ def _merge_azure_results(results):
     return merged
 
 
+def _analyze_pdf_range(client: DocumentIntelligenceClient, doc: fitz.Document, start_page: int, end_page: int):
+    with tempfile.NamedTemporaryFile(suffix=f".pages{start_page + 1}-{end_page}.pdf", delete=False) as tmp:
+        batch_path = Path(tmp.name)
+
+    batch_doc = fitz.open()
+    try:
+        batch_doc.insert_pdf(doc, from_page=start_page, to_page=end_page - 1)
+        batch_doc.save(str(batch_path))
+    finally:
+        batch_doc.close()
+
+    try:
+        batch_size = batch_path.stat().st_size
+        if batch_size > int(os.getenv("DOCUMENTINTELLIGENCE_MAX_BYTES", "4000000")) and end_page - start_page > 1:
+            mid_page = start_page + max(1, (end_page - start_page) // 2)
+            left = _analyze_pdf_range(client, doc, start_page, mid_page)
+            right = _analyze_pdf_range(client, doc, mid_page, end_page)
+            return left + right
+
+        return [(start_page, _analyze_pdf_batch(client, batch_path))]
+    finally:
+        try:
+            batch_path.unlink()
+        except Exception:
+            pass
+
+
 def analyze_pdf(source_uri: str):
+    batches = analyze_pdf_batches(source_uri)
+    return _merge_azure_results(batches)
+
+
+def analyze_pdf_batches(source_uri: str):
     path = Path(source_uri)
     if not path.exists():
         raise RuntimeError(f"source PDF not found: {source_uri}")
 
     client = get_document_intelligence_client()
-    max_bytes = int(os.getenv("DOCUMENTINTELLIGENCE_MAX_BYTES", "4000000"))
-    size = path.stat().st_size
 
-    if size <= max_bytes:
-        with fitz.open(str(path)) as doc:
-            batch_results = []
-            for start_page in range(0, doc.page_count, MAX_PAGES_PER_REQUEST):
-                end_page = min(start_page + MAX_PAGES_PER_REQUEST, doc.page_count)
-                with tempfile.NamedTemporaryFile(suffix=f".pages{start_page + 1}-{end_page}.pdf", delete=False) as tmp:
-                    batch_path = Path(tmp.name)
+    with fitz.open(str(path)) as doc:
+        start_page = 0
+        batch_results = []
+        while start_page < doc.page_count:
+            end_page = min(start_page + MAX_PAGES_PER_REQUEST, doc.page_count)
+            batch_result = _analyze_pdf_range(client, doc, start_page, end_page)
+            batch_results.extend(batch_result)
+            start_page = end_page
 
-                batch_doc = fitz.open()
-                try:
-                    batch_doc.insert_pdf(doc, from_page=start_page, to_page=end_page - 1)
-                    batch_doc.save(str(batch_path))
-                finally:
-                    batch_doc.close()
-
-                try:
-                    batch_result = _analyze_pdf_batch(client, batch_path)
-                    batch_results.append((start_page, batch_result))
-                finally:
-                    try:
-                        batch_path.unlink()
-                    except Exception:
-                        pass
-
-            return _merge_azure_results(batch_results)
-
-    raise RuntimeError(
-        f"source PDF exceeds DOCUMENTINTELLIGENCE_MAX_BYTES ({size} > {max_bytes}); split the PDF before OCR"
-    )
+        return batch_results

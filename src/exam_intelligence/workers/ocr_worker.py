@@ -18,7 +18,7 @@ def claim_job(conn) -> Optional[dict]:
             """
             SELECT job_id, payload
             FROM ingestion.job_queue
-            WHERE stage = 'ocr' AND status = 'pending' AND scheduled_at <= NOW()
+            WHERE stage = 'ocr' AND status IN ('pending', 'failed') AND scheduled_at <= NOW()
             ORDER BY scheduled_at
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -88,7 +88,7 @@ def run_loop(poll_interval: float = 1.0) -> None:
             return
         except Exception as exc:
             print("ocr-worker error:", exc)
-            time.sleep(2)
+            return
 
 
 if __name__ == "__main__":

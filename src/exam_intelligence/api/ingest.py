@@ -49,17 +49,13 @@ def _register_source(
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO ingestion.sources (source_id, source_type, source_kind, source_subtype, subject, publication_year, coverage_start_year, coverage_end_year, coverage_years_json, checksum, owner_user_id, filename, source_uri) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                "INSERT INTO ingestion.sources (source_id, source_type, source_kind, subject, year, checksum, owner_user_id, filename, source_uri) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     source_id,
                     source_kind,
                     source_kind,
-                    source_subtype,
                     subject,
                     publication_year,
-                    coverage_start_year,
-                    coverage_end_year,
-                    json.dumps(coverage_years),
                     checksum,
                     owner_user_id,
                     filename,

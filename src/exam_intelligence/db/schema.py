@@ -418,6 +418,19 @@ def ensure_compatible_schema(connection) -> None:
         ]:
             cursor.execute(f"ALTER TABLE ingestion.sources ADD COLUMN IF NOT EXISTS {column_sql}")
 
+        # Ensure newer source columns exist (keeps DB compatible with ingest._register_source)
+        for column_sql in [
+            "source_type TEXT",
+            "source_subtype TEXT",
+            "publication_year INTEGER",
+            "coverage_start_year INTEGER",
+            "coverage_end_year INTEGER",
+            "coverage_years_json JSONB NOT NULL DEFAULT '[]'::jsonb",
+            "checksum TEXT",
+            "upload_timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+        ]:
+            cursor.execute(f"ALTER TABLE ingestion.sources ADD COLUMN IF NOT EXISTS {column_sql}")
+
         for column_sql in [
             "source_uri TEXT",
             "page_number INTEGER",
