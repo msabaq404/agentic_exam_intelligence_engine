@@ -1,66 +1,31 @@
 name: exam_raw
 version: "0.1.0"
-description: "Coral source exposing raw PDF documents, pages, and text chunks for the exam ingestion pipeline. Use this source to surface uploaded PDFs into Coral tables for downstream enrichment agents."
-inputs:
-  EXAM_PDF_DIR:
-    kind: variable
-    hint: "Local path containing uploaded PDFs (example: ./data/pdfs)."
-    required: true
-backend:
-  kind: file
-  location: "{{input.EXAM_PDF_DIR}}"
+dsl_version: 3
+description: "Query raw parquet exports of source documents, pages, and chunks from the local coral_data directory."
+backend: parquet
 tables:
-  - table_name: pdf_documents
-    description: "One row per uploaded PDF document with basic metadata."
-    columns:
-      - name: source_id
-        data_type: Utf8
-      - name: source_type
-        data_type: Utf8
-      - name: subject
-        data_type: Utf8
-      - name: year
-        data_type: Utf8
-      - name: upload_timestamp
-        data_type: Timestamp
-      - name: checksum
-        data_type: Utf8
-      - name: filename
-        data_type: Utf8
+  - name: pdf_documents
+    description: "One row per uploaded PDF document with source metadata exported from ingestion.sources."
+    source:
+      location: file:///C:/Users/Sabaq/Projects/agentic_exam_intelligence_engine/coral_data/
+      glob: "ingestion_sources.parquet"
+    columns: []
 
-  - table_name: pdf_pages
-    description: "One row per PDF page. Text should be pre-extracted and stored in `page_text`."
-    columns:
-      - name: page_id
-        data_type: Utf8
-      - name: source_id
-        data_type: Utf8
-      - name: page_number
-        data_type: Int64
-      - name: page_text
-        data_type: Utf8
-      - name: ocr_confidence
-        data_type: Float64
+  - name: pdf_pages
+    description: "One row per PDF page exported from ingestion.pdf_pages."
+    source:
+      location: file:///C:/Users/Sabaq/Projects/agentic_exam_intelligence_engine/coral_data/
+      glob: "ingestion_pdf_pages.parquet"
+    columns: []
 
-  - table_name: pdf_chunks
-    description: "Semantic chunks extracted from pages (e.g., question blocks, paragraphs). Used as input to enrichment agents."
-    columns:
-      - name: chunk_id
-        data_type: Utf8
-      - name: page_id
-        data_type: Utf8
-      - name: source_id
-        data_type: Utf8
-      - name: chunk_order
-        data_type: Int64
-      - name: chunk_text
-        data_type: Utf8
-      - name: chunk_kind
-        data_type: Utf8
-      - name: extracted_entities_json
-        data_type: Utf8
+  - name: pdf_chunks
+    description: "Source chunks exported from ingestion.pdf_chunks."
+    source:
+      location: file:///C:/Users/Sabaq/Projects/agentic_exam_intelligence_engine/coral_data/
+      glob: "ingestion_pdf_chunks.parquet"
+    columns: []
 
 test_queries:
-  - "SELECT source_id, filename, upload_timestamp FROM pdf_documents ORDER BY upload_timestamp DESC LIMIT 10"
-  - "SELECT page_id, source_id, page_number FROM pdf_pages ORDER BY source_id, page_number LIMIT 50"
-  - "SELECT chunk_id, page_id, chunk_kind FROM pdf_chunks LIMIT 50"
+  - "SELECT source_id, source_kind, filename FROM exam_raw.pdf_documents LIMIT 1"
+  - "SELECT page_id, source_id, page_number FROM exam_raw.pdf_pages LIMIT 1"
+  - "SELECT chunk_id, source_id, chunk_kind FROM exam_raw.pdf_chunks LIMIT 1"

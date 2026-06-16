@@ -1,0 +1,22 @@
+{
+  "servers": {
+    "coral": {
+      "type": "stdio",
+      "command": "C:\\Users\\Sabaq\\.local\\bin\\coral.exe",
+      "args": [
+        "mcp-stdio"
+      ]
+    },
+    "gemini-api-docs-mcp": {
+      "type": "http",
+      "url": "https://gemini-api-docs-mcp.dev"
+    },
+    "docling": {
+      "type": "stdio",
+      "command": "C:\\Users\\Sabaq\\Projects\\agentic_exam_intelligence_engine\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\Sabaq\\Projects\\agentic_exam_intelligence_engine\\scripts\\run_docling_mcp.py"
+      ]
+    }
+  }
+}

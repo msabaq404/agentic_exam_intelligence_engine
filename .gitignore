@@ -11,8 +11,9 @@ build/
 dist/
 *.egg-info/
 .env
-.env.*
 data/
 *.db
 *.sqlite
 *.sqlite3
+scripts/
+node_modules/

@@ -1,0 +1,55 @@
+@import 'tailwindcss';
+
+@layer base {
+  :root {
+    color-scheme: dark;
+    font-family: Georgia, 'Times New Roman', Times, serif;
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background:
+      radial-gradient(circle at 20% 20%, rgba(148, 163, 184, 0.08), transparent 28%),
+      radial-gradient(circle at 80% 10%, rgba(245, 158, 11, 0.06), transparent 24%),
+      linear-gradient(180deg, #0f1114 0%, #15181c 100%);
+    color: #f3eee7;
+  }
+
+  ::selection {
+    background: rgba(245, 158, 11, 0.2);
+    color: #fff8ef;
+  }
+}
+
+@layer utilities {
+  .thin-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(245, 158, 11, 0.36) rgba(255, 255, 255, 0.04);
+    scrollbar-gutter: stable;
+  }
+
+  .thin-scrollbar::-webkit-scrollbar {
+    width: 2px;
+  }
+
+  .thin-scrollbar::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 999px;
+  }
+
+  .thin-scrollbar::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, rgba(245, 158, 11, 0.36), rgba(148, 163, 184, 0.24));
+    border: 1px solid rgba(15, 17, 20, 0.9);
+    border-radius: 999px;
+  }
+
+  .thin-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(180deg, rgba(245, 158, 11, 0.54), rgba(148, 163, 184, 0.34));
+  }
+}
