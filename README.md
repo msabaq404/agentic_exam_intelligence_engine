@@ -25,12 +25,12 @@ The prototype uses a lightweight SQL-first data access layer and source manifest
 
 Quick start (developer)
 -----------------------
-Install and run the backend (local dev):
+Install the package into the active environment, then run the backend:
 
 ```powershell
-pip install -e .
-exam-intel init-db
-exam-api --reload
+python -m pip install -e .
+python -m exam_intelligence.cli init-db
+python -m exam_intelligence.api.server --reload
 ```
 
 Install and run the frontend (local dev):
@@ -48,11 +48,18 @@ $env:VITE_API_BASE = "https://your-api-host"
 npm run dev
 ```
 
+Run the export listener, embedding, and LLM workers together in continuous mode:
+
+```powershell
+python -m exam_intelligence.cli run-workers
+```
+
 What’s implemented
 ------------------
 - File upload and ingestion endpoint (`POST /ingest/upload`).
 - OCR batch processing that splits PDFs into 2-page requests for Azure.
-- Workers for embedding, enrichment, and LLM-driven processing with configurable rate limits.
+- Workers for export, embedding, enrichment, and LLM-driven processing with configurable rate limits.
+- Export worker that listens for database changes and writes the current tables to `coral_data/` as Parquet snapshots.
 - API endpoints used by the dashboard: question list, question detail, analytics summary, and PDF download.
 - Frontend: dashboard (pagination), detail panel, analytics tab, agent tab, and ingestion UI.
 

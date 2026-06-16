@@ -25,6 +25,17 @@ TABLES = [
 ]
 
 
+def _listen_for_export_changes() -> None:
+    print("export-worker listening for database changes")
+    with connect() as conn:
+        conn.autocommit = True
+        conn.execute("LISTEN export_changed")
+
+        for notify in conn.notifies(timeout=None):
+            print("Change detected:", notify.payload)
+            export()
+
+
 def stringify_problematic_columns(df: pd.DataFrame) -> pd.DataFrame:
     for column in df.columns:
         series = df[column]
@@ -80,3 +91,11 @@ def export() -> None:
         export_table(table)
 
     print("\nAll tables exported successfully.")
+
+
+def run_loop() -> None:
+    export()
+    try:
+        _listen_for_export_changes()
+    except KeyboardInterrupt:
+        print("export-worker stopping")

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
+import time
 import uuid
 
 from .db.db import connect
@@ -32,6 +34,8 @@ def main() -> None:
     run_llm.add_argument("--once", action="store_true", help="Process one batch of pending jobs and exit")
     run_llm.add_argument("--drain", action="store_true", help="Process all pending jobs and exit")
     run_llm.add_argument("--poll-interval", type=float, default=1.0, help="Polling interval for continuous mode")
+    run_workers = subparsers.add_parser("run-workers", help="Run the embedding and LLM workers together in continuous mode")
+    run_workers.add_argument("--poll-interval", type=float, default=1.0, help="Polling interval for both workers")
     run_export = subparsers.add_parser("run-export", help="Export for Coral")
     
     args = parser.parse_args()
@@ -87,6 +91,34 @@ def main() -> None:
                             break
                         for job in jobs:
                             process_job(connection, job)
+    elif args.command == "run-workers":
+        from .workers.export_worker import run_loop as run_export_loop
+        from .workers.embed_worker import run_loop as run_embed_loop
+        from .workers.llm_worker import run_loop as run_llm_loop
+
+        threads = [
+            threading.Thread(target=run_export_loop, name="export-worker", daemon=True),
+            threading.Thread(
+                target=run_embed_loop,
+                kwargs={"poll_interval": args.poll_interval},
+                name="embed-worker-loop",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=run_llm_loop,
+                kwargs={"poll_interval": args.poll_interval},
+                name="llm-worker-loop",
+                daemon=True,
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+
+        try:
+            while any(thread.is_alive() for thread in threads):
+                time.sleep(1)
+        except KeyboardInterrupt:
+            return
     elif args.command == "run-export":
         from .workers.export_worker import export
         export()

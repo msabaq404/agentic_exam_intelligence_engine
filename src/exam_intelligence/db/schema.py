@@ -193,6 +193,17 @@ CREATE TABLE IF NOT EXISTS ingestion.llm_cache (
 """
 
 
+EXPORT_NOTIFY_TABLES = [
+    "ingestion.sources",
+    "ingestion.pdf_pages",
+    "ingestion.pdf_chunks",
+    "exam.questions",
+    "exam.textbook_chunks",
+    "exam.chapter_links",
+    "ingestion.embeddings",
+]
+
+
 def ensure_compatible_schema(connection) -> None:
     with connection.cursor() as cursor:
         cursor.execute("CREATE SCHEMA IF NOT EXISTS exam")
@@ -458,3 +469,50 @@ def ensure_compatible_schema(connection) -> None:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_questions_topic_year ON exam.questions (topic, year)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_textbook_chunks_chapter ON exam.textbook_chunks (chapter)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_student_performance_user_weakness ON exam.student_performance (user_id, weakness_score DESC)")
+
+        cursor.execute(
+            """
+            CREATE OR REPLACE FUNCTION ingestion.notify_export_changed()
+            RETURNS trigger
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+                PERFORM pg_notify(
+                    'export_changed',
+                    json_build_object(
+                        'table', TG_TABLE_SCHEMA || '.' || TG_TABLE_NAME,
+                        'op', TG_OP
+                    )::text
+                );
+
+                IF TG_OP = 'DELETE' THEN
+                    RETURN OLD;
+                END IF;
+
+                RETURN NEW;
+            END;
+            $$
+            """
+        )
+
+        for table_name in EXPORT_NOTIFY_TABLES:
+            trigger_name = f"trg_notify_export_changed_{table_name.replace('.', '_')}"
+            cursor.execute(
+                f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM pg_trigger
+                        WHERE tgname = '{trigger_name}'
+                          AND tgrelid = '{table_name}'::regclass
+                    ) THEN
+                        CREATE TRIGGER {trigger_name}
+                        AFTER INSERT OR UPDATE OR DELETE ON {table_name}
+                        FOR EACH ROW
+                        EXECUTE FUNCTION ingestion.notify_export_changed();
+                    END IF;
+                END
+                $$;
+                """
+            )
